@@ -296,7 +296,7 @@ static int dln2_adc_read_all(struct dln2_adc *dln2,
 {
 	int ret;
 	__u8 port = dln2->port;
-	int olen = sizeof(dln2_adc_get_all_vals);
+	int olen = sizeof(*get_all_vals);
 
 	ret = dln2_transfer(dln2->pdev, DLN2_ADC_CHANNEL_GET_ALL_VAL,
 			    &port, sizeof(port), get_all_vals, &olen);
@@ -304,7 +304,7 @@ static int dln2_adc_read_all(struct dln2_adc *dln2,
 		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
 		return ret;
 	}
-	if (olen < sizeof(dln2_adc_get_all_vals))
+	if (olen < sizeof(*get_all_vals))
 		return -EPROTO;
 
 	return 0;
@@ -563,6 +563,7 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	dln2->trig = devm_iio_trigger_alloc(dev, "samplerate");
 	if (!dln2->trig) {
 		dev_err(dev, "failed to allocate trigger\n");
+		ret = -ENOMEM;
 		goto dealloc_dev;
 	}
 	dln2->trig->ops = &dln2_adc_trigger_ops;
