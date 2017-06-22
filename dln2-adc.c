@@ -437,10 +437,13 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 {
 	struct iio_poll_func *pf = p;
 	struct iio_dev *indio_dev = pf->indio_dev;
-	int len = 0;
-	u16 *data;
+	struct {
+		__le16 values[DLN2_ADC_MAX_CHANNELS];
+		int64_t timestamp_space;
+	} data;
 	struct dln2_adc_get_all_vals dev_data;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
+	int i, j;
 
 	mutex_lock(&indio_dev->mlock);
 
@@ -457,34 +460,22 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 
 	mutex_unlock(&indio_dev->mlock);
 
-	data = kmalloc(indio_dev->scan_bytes, GFP_KERNEL);
-	if (!data)
-		goto done;
-
-	if (!bitmap_empty(indio_dev->active_scan_mask,
-			  indio_dev->masklength)) {
-		int i, j;
-
-		for (i = 0, j = 0;
-		     i < bitmap_weight(indio_dev->active_scan_mask,
-				       indio_dev->masklength);
-		     i++, j++) {
-			j = find_next_bit(indio_dev->active_scan_mask,
-					  indio_dev->masklength, j);
-			data[i] = dev_data.values[j];
-			len += 2;
-		}
+	for (i = 0, j = 0;
+	     i < bitmap_weight(indio_dev->active_scan_mask,
+			       indio_dev->masklength);
+	     i++, j++) {
+		j = find_next_bit(indio_dev->active_scan_mask,
+				  indio_dev->masklength, j);
+		data.values[i] = dev_data.values[j];
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
-	iio_push_to_buffers_with_timestamp(indio_dev, data,
+	iio_push_to_buffers_with_timestamp(indio_dev, &data,
 					   iio_get_time_ns(indio_dev));
 #else
-	iio_push_to_buffers_with_timestamp(indio_dev, data,
+	iio_push_to_buffers_with_timestamp(indio_dev, &data,
 					   iio_get_time_ns());
 #endif
-
-	kfree(data);
 
 done:
 	iio_trigger_notify_done(indio_dev->trig);
