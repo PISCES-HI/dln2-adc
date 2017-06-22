@@ -423,6 +423,7 @@ static const struct iio_chan_spec dln2_adc_iio_channels[] = {
 	DLN2_ADC_CHAN(5),
 	DLN2_ADC_CHAN(6),
 	DLN2_ADC_CHAN(7),
+	IIO_CHAN_SOFT_TIMESTAMP(8),
 };
 
 static const struct iio_info dln2_adc_info = {
@@ -557,7 +558,7 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	indio_dev->info = &dln2_adc_info;
 	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
 	indio_dev->channels = dln2_adc_iio_channels;
-	indio_dev->num_channels = chans;
+	indio_dev->num_channels = chans + 1;
 	indio_dev->setup_ops = &dln2_adc_buffer_setup_ops;
 
 	dln2->trig = devm_iio_trigger_alloc(dev, "samplerate");
