@@ -476,7 +476,7 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 		}
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
 	iio_push_to_buffers_with_timestamp(indio_dev, data,
 					   iio_get_time_ns(indio_dev));
 #else
