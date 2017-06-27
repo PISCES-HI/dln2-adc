@@ -7,7 +7,7 @@
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, version 2.
  */
-
+#define DEBUG 1
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -18,6 +18,7 @@
 #include <linux/iio/sysfs.h>
 #include <linux/iio/trigger.h>
 #include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
 #include <linux/iio/buffer.h>
 #include <linux/iio/kfifo_buf.h>
 
@@ -47,21 +48,27 @@
 #define DLN2_ADC_MAX_CHANNELS 8
 #define DLN2_ADC_DATA_BITS 10
 
+/*
+ * Plays similar role to iio_demux_table in subsystem core; except allocated
+ * in a fixed 8-element array.
+ */
+struct dln2_adc_demux_table {
+	unsigned from;
+	unsigned to;
+	unsigned length;
+};
+
 struct dln2_adc {
 	struct platform_device *pdev;
-	int port;
+	struct iio_chan_spec iio_channels[DLN2_ADC_MAX_CHANNELS + 1];
+	int port, trigger_chan;
 	struct iio_trigger *trig;
 	struct mutex mutex;
-	/* Set once initialized */
-	bool port_enabled;
-	/* Set once resolution request made to HW */
-	bool resolution_set;
-	/* Bitmask requesting enabled channels */
-	unsigned long chans_requested;
-	/* Bitmask indicating enabled channels on HW */
-	unsigned long chans_enabled;
-	/* Channel that is arbitrated for event trigger */
-	int trigger_chan;
+	/* Cached sample period in milliseconds */
+	unsigned int sample_period;
+	/* Demux table */
+	unsigned int demux_count;
+	struct dln2_adc_demux_table demux[DLN2_ADC_MAX_CHANNELS];
 };
 
 struct dln2_adc_port_chan {
@@ -73,6 +80,54 @@ struct dln2_adc_get_all_vals {
 	__le16 channel_mask;
 	__le16 values[DLN2_ADC_MAX_CHANNELS];
 };
+
+static void dln2_adc_add_demux(struct dln2_adc *dln2,
+	unsigned int in_loc, unsigned int out_loc,
+	unsigned int length)
+{
+	struct dln2_adc_demux_table *p = dln2->demux_count ?
+		&dln2->demux[dln2->demux_count - 1] : NULL;
+	if (p && p->from + p->length == in_loc &&
+		p->to + p->length == out_loc) {
+		p->length += length;
+	} else if (dln2->demux_count < DLN2_ADC_MAX_CHANNELS) {
+		p = &dln2->demux[dln2->demux_count++];
+		p->from = in_loc;
+		p->to = out_loc;
+		p->length = length;
+	}
+}
+
+static void dln2_adc_update_demux(struct dln2_adc *dln2)
+{
+	int in_ind = -1, out_ind;
+	unsigned in_loc = 0, out_loc = 0;
+	struct iio_dev *indio_dev = platform_get_drvdata(dln2->pdev);
+
+	/* Clear out any old demux */
+	dln2->demux_count = 0;
+
+	/* Optimize all 8-channels case */
+	if (indio_dev->masklength &&
+	    (*indio_dev->active_scan_mask & 0xff) == 0xff) {
+		dln2_adc_add_demux(dln2, 0, 0, 16);
+		return;
+	}
+
+	/* Build demux table from fixed 8-channels to active_scan_mask */
+	for_each_set_bit(out_ind,
+			 indio_dev->active_scan_mask,
+			 indio_dev->masklength) {
+		/* Handle timestamp separately */
+		if (out_ind == DLN2_ADC_MAX_CHANNELS)
+			break;
+		for (++in_ind; in_ind != out_ind; ++in_ind)
+			in_loc += 2;
+		dln2_adc_add_demux(dln2, in_loc, out_loc, 2);
+		out_loc += 2;
+		in_loc += 2;
+	}
+}
 
 static int dln2_adc_get_chan_count(struct dln2_adc *dln2)
 {
@@ -131,7 +186,8 @@ static int dln2_adc_set_chan_enabled(struct dln2_adc *dln2,
 	return 0;
 }
 
-static int dln2_adc_set_port_enabled(struct dln2_adc *dln2, bool enable)
+static int dln2_adc_set_port_enabled(struct dln2_adc *dln2, bool enable,
+				     u16 *conflict_out)
 {
 	int ret;
 	u8 port = dln2->port;
@@ -139,12 +195,16 @@ static int dln2_adc_set_port_enabled(struct dln2_adc *dln2, bool enable)
 	int olen = sizeof(conflict);
 
 	u16 cmd = enable ? DLN2_ADC_ENABLE : DLN2_ADC_DISABLE;
+	if (conflict_out)
+		*conflict_out = 0;
 
 	ret = dln2_transfer(dln2->pdev, cmd, &port, sizeof(port),
 			    &conflict, &olen);
 	if (ret < 0) {
 		dev_dbg(&dln2->pdev->dev, "Problem in %s(%d)\n",
 			__func__, (int)enable);
+		if (conflict_out && enable && olen >= sizeof(conflict))
+			*conflict_out = le16_to_cpu(conflict);
 		return ret;
 	}
 	if (enable && olen < sizeof(conflict))
@@ -153,88 +213,8 @@ static int dln2_adc_set_port_enabled(struct dln2_adc *dln2, bool enable)
 	return 0;
 }
 
-/*
- * ADC channels are lazily enabled due to the pins being shared with GPIO
- * channels. Enabling channels requires taking the ADC port offline, specifying
- * the resolution, individually enabling channels, then putting the port back
- * online. If GPIO pins have already been exported by gpio_dln2, EINVAL is
- * reported.
- */
-static int dln2_adc_update_enabled_chans(struct dln2_adc *dln2)
-{
-	int ret, i, chan_count;
-	struct iio_dev *indio_dev;
-
-	if (dln2->chans_enabled == dln2->chans_requested)
-		return 0;
-
-	indio_dev = platform_get_drvdata(dln2->pdev);
-	chan_count = indio_dev->num_channels;
-
-	if (dln2->port_enabled) {
-		ret = dln2_adc_set_port_enabled(dln2, false);
-		if (ret < 0)
-			return ret;
-		dln2->port_enabled = false;
-	}
-
-	if (!dln2->resolution_set) {
-		ret = dln2_adc_set_port_resolution(dln2);
-		if (ret < 0)
-			return ret;
-		dln2->resolution_set = true;
-	}
-
-	for (i = 0; i < chan_count; ++i) {
-		bool requested = dln2->chans_requested & (1 << i);
-		bool enabled = dln2->chans_enabled & (1 << i);
-
-		if (requested == enabled)
-			continue;
-		ret = dln2_adc_set_chan_enabled(dln2, i, requested);
-		if (ret < 0)
-			return ret;
-	}
-
-	dln2->chans_enabled = dln2->chans_requested;
-
-	ret = dln2_adc_set_port_enabled(dln2, true);
-	if (ret < 0)
-		return ret;
-	dln2->port_enabled = true;
-
-	return 0;
-}
-
-static int dln2_adc_get_chan_freq(struct dln2_adc *dln2, unsigned int channel)
-{
-	int ret;
-	struct dln2_adc_port_chan port_chan = {
-		.port = dln2->port,
-		.chan = channel,
-	};
-	struct {
-		__u8 type;
-		__le16 period;
-		__le16 low;
-		__le16 high;
-	} __packed get_cfg;
-	int olen = sizeof(get_cfg);
-
-	ret = dln2_transfer(dln2->pdev, DLN2_ADC_CHANNEL_GET_CFG,
-			    &port_chan, sizeof(port_chan), &get_cfg, &olen);
-	if (ret < 0) {
-		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
-		return ret;
-	}
-	if (olen < sizeof(get_cfg))
-		return -EPROTO;
-
-	return get_cfg.period;
-}
-
-static int dln2_adc_set_chan_freq(struct dln2_adc *dln2, unsigned int channel,
-				  unsigned int freq)
+static int dln2_adc_set_chan_period(struct dln2_adc *dln2,
+	unsigned int channel, unsigned int period)
 {
 	int ret;
 	struct {
@@ -246,8 +226,8 @@ static int dln2_adc_set_chan_freq(struct dln2_adc *dln2, unsigned int channel,
 	} __packed set_cfg = {
 		.port_chan.port = dln2->port,
 		.port_chan.chan = channel,
-		.type = freq ? DLN2_ADC_EVENT_ALWAYS : DLN2_ADC_EVENT_NONE,
-		.period = cpu_to_le16(freq)
+		.type = period ? DLN2_ADC_EVENT_ALWAYS : DLN2_ADC_EVENT_NONE,
+		.period = cpu_to_le16(period)
 	};
 
 	ret = dln2_transfer_tx(dln2->pdev, DLN2_ADC_CHANNEL_SET_CFG,
@@ -261,16 +241,29 @@ static int dln2_adc_set_chan_freq(struct dln2_adc *dln2, unsigned int channel,
 
 static int dln2_adc_read(struct dln2_adc *dln2, unsigned int channel)
 {
-	int ret;
-	int old_chans_requested = dln2->chans_requested;
+	int ret, i;
+	struct iio_dev *indio_dev = platform_get_drvdata(dln2->pdev);
+	u16 conflict;
 
-	dln2->chans_requested |= (1 << channel);
-	ret = dln2_adc_update_enabled_chans(dln2);
-	if (ret < 0) {
-		dln2->chans_requested = old_chans_requested;
-		return ret;
+	if (iio_buffer_enabled(indio_dev)) {
+		ret = -EBUSY;
+		goto out;
 	}
-	dln2->port_enabled = true;
+
+	ret = dln2_adc_set_chan_enabled(dln2, channel, true);
+	if (ret < 0)
+		goto out;
+
+	ret = dln2_adc_set_port_enabled(dln2, true, &conflict);
+	if (ret < 0) {
+		if (conflict) {
+			dev_err(&dln2->pdev->dev,
+				"ADC pins conflict with mask %04X\n",
+				(int)conflict);
+			ret = -EBUSY;
+		}
+		goto disable_chan;
+	}
 
 	struct dln2_adc_port_chan port_chan = {
 		.port = dln2->port,
@@ -279,16 +272,31 @@ static int dln2_adc_read(struct dln2_adc *dln2, unsigned int channel)
 	__le16 value;
 	int olen = sizeof(value);
 
-	ret = dln2_transfer(dln2->pdev, DLN2_ADC_CHANNEL_GET_VAL,
-			    &port_chan, sizeof(port_chan), &value, &olen);
-	if (ret < 0) {
-		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
-		return ret;
+	/*
+	 * Call GET_VAL twice due to initial zero-return immediately after
+	 * enabling channel.
+	 */
+	for (i = 0; i < 2; ++i) {
+		ret = dln2_transfer(dln2->pdev, DLN2_ADC_CHANNEL_GET_VAL,
+				    &port_chan, sizeof(port_chan), &value, &olen);
+		if (ret < 0) {
+			dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
+			goto disable_port;
+		}
+		if (olen < sizeof(value)) {
+			ret = -EPROTO;
+			goto disable_port;
+		}
 	}
-	if (olen < sizeof(value))
-		return -EPROTO;
 
-	return le16_to_cpu(value);
+	ret = le16_to_cpu(value);
+
+disable_port:
+	dln2_adc_set_port_enabled(dln2, false, NULL);
+disable_chan:
+	dln2_adc_set_chan_enabled(dln2, channel, false);
+out:
+	return ret;
 }
 
 static int dln2_adc_read_all(struct dln2_adc *dln2,
@@ -317,6 +325,7 @@ static int dln2_adc_read_raw(struct iio_dev *indio_dev,
 			     long mask)
 {
 	int ret;
+	unsigned int microhertz;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
 
 	switch (mask) {
@@ -332,24 +341,24 @@ static int dln2_adc_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE:
+		/*
+		 * Voltage reference is fixed at 3.3v
+		 *  3.3 / (1 << 10) * 1000000000
+		 */
 		*val = 0;
-		/* 3.3 / (1 << 10) * 1000000000 */
 		*val2 = 3222656;
 		return IIO_VAL_INT_PLUS_NANO;
 
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		mutex_lock(&dln2->mutex);
-		if (dln2->trigger_chan == -1)
-			ret = 0;
-		else
-			ret = dln2_adc_get_chan_freq(dln2, dln2->trigger_chan);
-		mutex_unlock(&dln2->mutex);
+		if (dln2->sample_period) {
+			microhertz = 1000000000 / dln2->sample_period;
+			*val = microhertz / 1000000;
+			*val2 = microhertz % 1000000;
+		} else {
+			*val = 0;
+			*val2 = 0;
+		}
 
-		if (ret < 0)
-			return ret;
-
-		*val = ret / 1000;
-		*val2 = (ret % 1000) * 1000;
 		return IIO_VAL_INT_PLUS_MICRO;
 
 	default:
@@ -364,40 +373,72 @@ static int dln2_adc_write_raw(struct iio_dev *indio_dev,
 			      long mask)
 {
 	int ret;
-	unsigned int freq;
+	unsigned int microhertz;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		freq = val * 1000 + val2 / 1000;
-		if (freq > 65535) {
-			freq = 65535;
-			dev_warn(&dln2->pdev->dev,
-				 "clamping freq to 65535ms\n");
-		}
+		microhertz = 1000000 * val + val2;
+
 		mutex_lock(&dln2->mutex);
+
+		dln2->sample_period =
+			microhertz ? 1000000000 / microhertz : UINT_MAX;
+		if (dln2->sample_period > 65535) {
+			dln2->sample_period = 65535;
+			dev_warn(&dln2->pdev->dev,
+				 "clamping period to 65535ms\n");
+		}
 
 		/*
 		 * The first requested channel is arbitrated as a shared
-		 * trigger source, so only one event is registered with the DLN.
-		 * The event handler will then read all enabled channel values
-		 * using DLN2_ADC_CHANNEL_GET_ALL_VAL to maintain
+		 * trigger source, so only one event is registered with the
+		 * DLN. The event handler will then read all enabled channel
+		 * values using DLN2_ADC_CHANNEL_GET_ALL_VAL to maintain
 		 * synchronization between ADC readings.
 		 */
-		if (dln2->trigger_chan == -1)
-			dln2->trigger_chan = chan->channel;
-		ret = dln2_adc_set_chan_freq(dln2, dln2->trigger_chan, freq);
+		if (dln2->trigger_chan != -1)
+			ret = dln2_adc_set_chan_period(dln2,
+				dln2->trigger_chan, dln2->sample_period);
+		else
+			ret = 0;
 
 		mutex_unlock(&dln2->mutex);
 
-		if (ret < 0)
-			return ret;
-
-		return 0;
+		return ret;
 
 	default:
 		return -EINVAL;
 	}
+}
+
+static int dln2_update_scan_mode(struct iio_dev *indio_dev,
+				 const unsigned long *scan_mask)
+{
+	struct dln2_adc *dln2 = iio_priv(indio_dev);
+	int chan_count = indio_dev->num_channels - 1;
+	int ret, i, j;
+
+	mutex_lock(&dln2->mutex);
+
+	for (i = 0; i < chan_count; ++i) {
+		ret = dln2_adc_set_chan_enabled(dln2, i,
+						test_bit(i, scan_mask));
+		if (ret < 0) {
+			for (j = 0; j < i; ++j)
+				dln2_adc_set_chan_enabled(dln2, j, false);
+			mutex_unlock(&dln2->mutex);
+			dev_err(&dln2->pdev->dev,
+				"Unable to enable ADC channel %d\n", i);
+			return -EBUSY;
+		}
+	}
+
+	dln2_adc_update_demux(dln2);
+
+	mutex_unlock(&dln2->mutex);
+
+	return 0;
 }
 
 #define DLN2_ADC_CHAN(idx) {					\
@@ -408,27 +449,18 @@ static int dln2_adc_write_raw(struct iio_dev *indio_dev,
 	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SCALE) |	\
 				   BIT(IIO_CHAN_INFO_SAMP_FREQ),\
 	.scan_index = idx,					\
-	.scan_type.sign = 'u',					\
-	.scan_type.realbits = DLN2_ADC_DATA_BITS,		\
-	.scan_type.storagebits = 16,				\
-	.scan_type.endianness = IIO_LE,				\
+	.scan_type = {						\
+		.sign = 'u',					\
+		.realbits = DLN2_ADC_DATA_BITS,			\
+		.storagebits = 16,				\
+		.endianness = IIO_LE,				\
+	}							\
 }
-
-static const struct iio_chan_spec dln2_adc_iio_channels[] = {
-	DLN2_ADC_CHAN(0),
-	DLN2_ADC_CHAN(1),
-	DLN2_ADC_CHAN(2),
-	DLN2_ADC_CHAN(3),
-	DLN2_ADC_CHAN(4),
-	DLN2_ADC_CHAN(5),
-	DLN2_ADC_CHAN(6),
-	DLN2_ADC_CHAN(7),
-	IIO_CHAN_SOFT_TIMESTAMP(8),
-};
 
 static const struct iio_info dln2_adc_info = {
 	.read_raw = dln2_adc_read_raw,
 	.write_raw = dln2_adc_write_raw,
+	.update_scan_mode = dln2_update_scan_mode,
 	.driver_module = THIS_MODULE,
 };
 
@@ -442,32 +474,19 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 	} data;
 	struct dln2_adc_get_all_vals dev_data;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
-	int old_chans_requested;
-	int i, j;
+	int ret, i;
 
 	mutex_lock(&dln2->mutex);
-
-	old_chans_requested = dln2->chans_requested;
-	dln2->chans_requested |= *indio_dev->active_scan_mask;
-	if (dln2_adc_update_enabled_chans(dln2) < 0) {
-		dln2->chans_requested = old_chans_requested;
-		mutex_unlock(&dln2->mutex);
-		goto done;
-	}
-
-	if (dln2_adc_read_all(dln2, &dev_data) < 0) {
-		mutex_unlock(&dln2->mutex);
-		goto done;
-	}
-
+	ret = dln2_adc_read_all(dln2, &dev_data);
 	mutex_unlock(&dln2->mutex);
+	if (ret < 0)
+		goto done;
 
-	for (i = 0, j = 0;
-	     i < bitmap_weight(indio_dev->active_scan_mask,
-			       indio_dev->masklength); i++, j++) {
-		j = find_next_bit(indio_dev->active_scan_mask,
-				  indio_dev->masklength, j);
-		data.values[i] = dev_data.values[j];
+	/* Demux operation */
+	for (i = 0; i < dln2->demux_count; ++i) {
+		const struct dln2_adc_demux_table *t = &dln2->demux[i];
+		memcpy((void *)data.values + t->to,
+		       (void *)dev_data.values + t->from, t->length);
 	}
 
 	iio_push_to_buffers_with_timestamp(indio_dev, &data,
@@ -482,22 +501,67 @@ static int dln2_adc_triggered_buffer_postenable(struct iio_dev *indio_dev)
 {
 	int ret;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
+	u16 conflict;
 
 	mutex_lock(&dln2->mutex);
-	dln2->chans_requested |= *indio_dev->active_scan_mask;
-	ret = dln2_adc_update_enabled_chans(dln2);
+
+	/* Enable ADC */
+	ret = dln2_adc_set_port_enabled(dln2, true, &conflict);
+	if (ret < 0) {
+		mutex_unlock(&dln2->mutex);
+		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
+		if (conflict) {
+			dev_err(&dln2->pdev->dev,
+				"ADC pins conflict with mask %04X\n",
+				(int)conflict);
+			ret = -EBUSY;
+		}
+		return ret;
+	}
+
+	/* Assign trigger channel based on first enabled channel */
+	unsigned int trigger_chan =
+		find_first_bit(indio_dev->active_scan_mask,
+			       indio_dev->masklength);
+	if (trigger_chan < DLN2_ADC_MAX_CHANNELS) {
+		dln2->trigger_chan = trigger_chan;
+		ret = dln2_adc_set_chan_period(dln2, dln2->trigger_chan,
+					       dln2->sample_period);
+		mutex_unlock(&dln2->mutex);
+		if (ret < 0) {
+			dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
+			return ret;
+		}
+	}
+	else {
+		dln2->trigger_chan = -1;
+		mutex_unlock(&dln2->mutex);
+	}
+
+	return iio_triggered_buffer_postenable(indio_dev);
+}
+
+static int dln2_adc_triggered_buffer_predisable(struct iio_dev *indio_dev)
+{
+	int ret;
+	struct dln2_adc *dln2 = iio_priv(indio_dev);
+
+	mutex_lock(&dln2->mutex);
+	/* Disable ADC */
+	ret = dln2_adc_set_port_enabled(dln2, false, NULL);
+	dln2->trigger_chan = -1;
 	mutex_unlock(&dln2->mutex);
 	if (ret < 0) {
 		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
 		return ret;
 	}
 
-	return iio_triggered_buffer_postenable(indio_dev);
+	return iio_triggered_buffer_predisable(indio_dev);
 }
 
 static const struct iio_buffer_setup_ops dln2_adc_buffer_setup_ops = {
 	.postenable = dln2_adc_triggered_buffer_postenable,
-	.predisable = iio_triggered_buffer_predisable,
+	.predisable = dln2_adc_triggered_buffer_predisable,
 };
 
 static void dln2_adc_event(struct platform_device *pdev, u16 echo,
@@ -506,7 +570,8 @@ static void dln2_adc_event(struct platform_device *pdev, u16 echo,
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
 
-	iio_trigger_poll(dln2->trig);
+	/* Ultimately called via URB completion handler */
+	iio_trigger_poll_chained(dln2->trig);
 }
 
 static const struct iio_trigger_ops dln2_adc_trigger_ops = {
@@ -519,11 +584,9 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	struct dln2_adc *dln2;
 	struct dln2_platform_data *pdata = dev_get_platdata(&pdev->dev);
 	struct iio_dev *indio_dev;
-	struct iio_buffer *buffer;
-	int ret;
-	int chans;
+	int i, ret, chans;
 
-	indio_dev = devm_iio_device_alloc(dev, sizeof(struct dln2_adc));
+	indio_dev = devm_iio_device_alloc(dev, sizeof(*dln2));
 	if (!indio_dev) {
 		dev_err(dev, "failed allocating iio device\n");
 		return -ENOMEM;
@@ -532,14 +595,18 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	dln2 = iio_priv(indio_dev);
 	dln2->pdev = pdev;
 	dln2->port = pdata->port;
-	mutex_init(&dln2->mutex);
-	dln2->port_enabled = false;
-	dln2->resolution_set = false;
-	dln2->chans_requested = 0;
-	dln2->chans_enabled = 0;
 	dln2->trigger_chan = -1;
+	mutex_init(&dln2->mutex);
+	dln2->sample_period = 0;
+	dln2->demux_count = 0;
 
 	platform_set_drvdata(pdev, indio_dev);
+
+	ret = dln2_adc_set_port_resolution(dln2);
+	if (ret < 0) {
+		dev_err(dev, "failed to set ADC resolution to 10 bits\n");
+		goto dealloc_dev;
+	}
 
 	chans = dln2_adc_get_chan_count(dln2);
 	if (chans < 0) {
@@ -553,15 +620,23 @@ static int dln2_adc_probe(struct platform_device *pdev)
 			 DLN2_ADC_MAX_CHANNELS);
 	}
 
+	for (i = 0; i < chans; ++i) {
+		struct iio_chan_spec chan_spec = DLN2_ADC_CHAN(i);
+		dln2->iio_channels[i] = chan_spec;
+	}
+	struct iio_chan_spec timestamp_spec = IIO_CHAN_SOFT_TIMESTAMP(i);
+	dln2->iio_channels[i] = timestamp_spec;
+
 	indio_dev->name = DLN2_ADC_MOD_NAME;
 	indio_dev->dev.parent = dev;
 	indio_dev->info = &dln2_adc_info;
-	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
-	indio_dev->channels = dln2_adc_iio_channels;
+	indio_dev->modes = INDIO_DIRECT_MODE;
+	indio_dev->channels = dln2->iio_channels;
 	indio_dev->num_channels = chans + 1;
 	indio_dev->setup_ops = &dln2_adc_buffer_setup_ops;
 
-	dln2->trig = devm_iio_trigger_alloc(dev, "samplerate");
+	dln2->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
+					    indio_dev->name, indio_dev->id);
 	if (!dln2->trig) {
 		dev_err(dev, "failed to allocate trigger\n");
 		ret = -ENOMEM;
@@ -572,24 +647,11 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	iio_trigger_register(dln2->trig);
 	iio_trigger_set_immutable(indio_dev, dln2->trig);
 
-	buffer = devm_iio_kfifo_allocate(dev);
-	if (!buffer) {
-		dev_err(dev, "failed to allocate kfifo\n");
-		ret = -ENOMEM;
+	ret = iio_triggered_buffer_setup(indio_dev, NULL, dln2_adc_trigger_h,
+					 &dln2_adc_buffer_setup_ops);
+	if (ret) {
+		dev_err(dev, "failed to allocate triggered buffer: %d\n", ret);
 		goto dealloc_trigger;
-	}
-
-	iio_device_attach_buffer(indio_dev, buffer);
-
-	indio_dev->pollfunc = iio_alloc_pollfunc(NULL,
-						 &dln2_adc_trigger_h,
-						 IRQF_ONESHOT,
-						 indio_dev,
-						 "samplerate");
-
-	if (!indio_dev->pollfunc) {
-		ret = -ENOMEM;
-		goto dealloc_kfifo;
 	}
 
 	ret = dln2_register_event_cb(pdev, DLN2_ADC_CONDITION_MET_EV,
@@ -608,8 +670,7 @@ static int dln2_adc_probe(struct platform_device *pdev)
 	return 0;
 
 dealloc_pollfunc:
-	iio_dealloc_pollfunc(indio_dev->pollfunc);
-dealloc_kfifo:
+	iio_triggered_buffer_cleanup(indio_dev);
 dealloc_trigger:
 	iio_trigger_unregister(dln2->trig);
 dealloc_dev:
@@ -625,7 +686,7 @@ static int dln2_adc_remove(struct platform_device *pdev)
 	iio_device_unregister(indio_dev);
 	dln2_unregister_event_cb(pdev, DLN2_ADC_CONDITION_MET_EV);
 	iio_trigger_unregister(dln2->trig);
-	iio_dealloc_pollfunc(indio_dev->pollfunc);
+	iio_triggered_buffer_cleanup(indio_dev);
 
 	return 0;
 }

@@ -11,7 +11,7 @@
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, version 2.
  */
-
+#define DEBUG 1
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
