@@ -53,9 +53,9 @@
  * in a fixed 8-element array.
  */
 struct dln2_adc_demux_table {
-	unsigned from;
-	unsigned to;
-	unsigned length;
+	unsigned int from;
+	unsigned int to;
+	unsigned int length;
 };
 
 struct dln2_adc {
@@ -69,6 +69,8 @@ struct dln2_adc {
 	/* Demux table */
 	unsigned int demux_count;
 	struct dln2_adc_demux_table demux[DLN2_ADC_MAX_CHANNELS];
+	/* Precomputed timestamp padding offset and length */
+	unsigned int ts_pad_offset, ts_pad_length;
 };
 
 struct dln2_adc_port_chan {
@@ -107,10 +109,14 @@ static void dln2_adc_update_demux(struct dln2_adc *dln2)
 	/* Clear out any old demux */
 	dln2->demux_count = 0;
 
+	dev_info(&dln2->pdev->dev, "SCAN MASK: %08X\n", (int)(*indio_dev->active_scan_mask));
+
 	/* Optimize all 8-channels case */
 	if (indio_dev->masklength &&
 	    (*indio_dev->active_scan_mask & 0xff) == 0xff) {
 		dln2_adc_add_demux(dln2, 0, 0, 16);
+		dln2->ts_pad_offset = 0;
+		dln2->ts_pad_length = 0;
 		return;
 	}
 
@@ -126,6 +132,15 @@ static void dln2_adc_update_demux(struct dln2_adc *dln2)
 		dln2_adc_add_demux(dln2, in_loc, out_loc, 2);
 		out_loc += 2;
 		in_loc += 2;
+	}
+
+	if (indio_dev->scan_timestamp) {
+		size_t ts_offset = indio_dev->scan_bytes / sizeof(int64_t) - 1;
+		dln2->ts_pad_offset = out_loc;
+		dln2->ts_pad_length = ts_offset * sizeof(int64_t) - out_loc;
+	} else {
+		dln2->ts_pad_offset = 0;
+		dln2->ts_pad_length = 0;
 	}
 }
 
@@ -487,10 +502,20 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 		const struct dln2_adc_demux_table *t = &dln2->demux[i];
 		memcpy((void *)data.values + t->to,
 		       (void *)dev_data.values + t->from, t->length);
+		dev_info(&dln2->pdev->dev,
+			 "%d From %u To %u Len %u\n", i, t->from, t->to, t->length);
+	}
+
+	/* Zero padding space between values and timestamp */
+	if (dln2->ts_pad_length) {
+		memset((void *)data.values + dln2->ts_pad_offset,
+		       0, dln2->ts_pad_length);
+		dev_info(&dln2->pdev->dev,
+			 "PAD To %u Len %u\n", dln2->ts_pad_offset, dln2->ts_pad_length);
 	}
 
 	iio_push_to_buffers_with_timestamp(indio_dev, &data,
-					   iio_get_time_ns(indio_dev));
+					   iio_get_time_ns());
 
 done:
 	iio_trigger_notify_done(indio_dev->trig);
@@ -547,9 +572,16 @@ static int dln2_adc_triggered_buffer_predisable(struct iio_dev *indio_dev)
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
 
 	mutex_lock(&dln2->mutex);
+
+	/* Disable trigger channel */
+	if (dln2->trigger_chan != -1) {
+		dln2_adc_set_chan_period(dln2, dln2->trigger_chan, 0);
+		dln2->trigger_chan = -1;
+	}
+
 	/* Disable ADC */
 	ret = dln2_adc_set_port_enabled(dln2, false, NULL);
-	dln2->trigger_chan = -1;
+
 	mutex_unlock(&dln2->mutex);
 	if (ret < 0) {
 		dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
@@ -570,8 +602,8 @@ static void dln2_adc_event(struct platform_device *pdev, u16 echo,
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
 
-	/* Ultimately called via URB completion handler */
-	iio_trigger_poll_chained(dln2->trig);
+	/* Called via URB completion handler */
+	iio_trigger_poll(dln2->trig);
 }
 
 static const struct iio_trigger_ops dln2_adc_trigger_ops = {
