@@ -103,7 +103,7 @@ static void dln2_adc_add_demux(struct dln2_adc *dln2,
 static void dln2_adc_update_demux(struct dln2_adc *dln2)
 {
 	int in_ind = -1, out_ind;
-	unsigned in_loc = 0, out_loc = 0;
+	unsigned int in_loc = 0, out_loc = 0;
 	struct iio_dev *indio_dev = platform_get_drvdata(dln2->pdev);
 
 	/* Clear out any old demux */
@@ -134,6 +134,7 @@ static void dln2_adc_update_demux(struct dln2_adc *dln2)
 
 	if (indio_dev->scan_timestamp) {
 		size_t ts_offset = indio_dev->scan_bytes / sizeof(int64_t) - 1;
+
 		dln2->ts_pad_offset = out_loc;
 		dln2->ts_pad_length = ts_offset * sizeof(int64_t) - out_loc;
 	} else {
@@ -208,6 +209,7 @@ static int dln2_adc_set_port_enabled(struct dln2_adc *dln2, bool enable,
 	int olen = sizeof(conflict);
 
 	u16 cmd = enable ? DLN2_ADC_ENABLE : DLN2_ADC_DISABLE;
+
 	if (conflict_out)
 		*conflict_out = 0;
 
@@ -291,7 +293,8 @@ static int dln2_adc_read(struct dln2_adc *dln2, unsigned int channel)
 	 */
 	for (i = 0; i < 2; ++i) {
 		ret = dln2_transfer(dln2->pdev, DLN2_ADC_CHANNEL_GET_VAL,
-				    &port_chan, sizeof(port_chan), &value, &olen);
+				    &port_chan, sizeof(port_chan),
+				    &value, &olen);
 		if (ret < 0) {
 			dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
 			goto disable_port;
@@ -487,6 +490,7 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 	} data;
 	struct dln2_adc_get_all_vals dev_data;
 	struct dln2_adc *dln2 = iio_priv(indio_dev);
+	const struct dln2_adc_demux_table *t;
 	int ret, i;
 
 	mutex_lock(&dln2->mutex);
@@ -497,7 +501,7 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 
 	/* Demux operation */
 	for (i = 0; i < dln2->demux_count; ++i) {
-		const struct dln2_adc_demux_table *t = &dln2->demux[i];
+		t = &dln2->demux[i];
 		memcpy((void *)data.values + t->to,
 		       (void *)dev_data.values + t->from, t->length);
 	}
@@ -550,8 +554,7 @@ static int dln2_adc_triggered_buffer_postenable(struct iio_dev *indio_dev)
 			dev_dbg(&dln2->pdev->dev, "Problem in %s\n", __func__);
 			return ret;
 		}
-	}
-	else {
+	} else {
 		dln2->trigger_chan = -1;
 		mutex_unlock(&dln2->mutex);
 	}
