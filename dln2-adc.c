@@ -7,7 +7,7 @@
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, version 2.
  */
-#define DEBUG 1
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -108,8 +108,6 @@ static void dln2_adc_update_demux(struct dln2_adc *dln2)
 
 	/* Clear out any old demux */
 	dln2->demux_count = 0;
-
-	dev_info(&dln2->pdev->dev, "SCAN MASK: %08X\n", (int)(*indio_dev->active_scan_mask));
 
 	/* Optimize all 8-channels case */
 	if (indio_dev->masklength &&
@@ -502,17 +500,12 @@ static irqreturn_t dln2_adc_trigger_h(int irq, void *p)
 		const struct dln2_adc_demux_table *t = &dln2->demux[i];
 		memcpy((void *)data.values + t->to,
 		       (void *)dev_data.values + t->from, t->length);
-		dev_info(&dln2->pdev->dev,
-			 "%d From %u To %u Len %u\n", i, t->from, t->to, t->length);
 	}
 
 	/* Zero padding space between values and timestamp */
-	if (dln2->ts_pad_length) {
+	if (dln2->ts_pad_length)
 		memset((void *)data.values + dln2->ts_pad_offset,
 		       0, dln2->ts_pad_length);
-		dev_info(&dln2->pdev->dev,
-			 "PAD To %u Len %u\n", dln2->ts_pad_offset, dln2->ts_pad_length);
-	}
 
 	iio_push_to_buffers_with_timestamp(indio_dev, &data,
 					   iio_get_time_ns(indio_dev));
